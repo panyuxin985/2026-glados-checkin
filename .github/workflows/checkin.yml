@@ -61,11 +61,10 @@ jobs:
           CHECKIN_DIAGNOSTIC_ONLY: ${{ inputs.diagnose_only && 'true' || 'false' }}
 
       - name: Install browser client
-        if: ${{ !inputs.diagnose_only }}
         run: python -m pip install playwright==1.56.0
 
       - name: Check in on the GLaDOS website
-        if: ${{ !inputs.diagnose_only }}
         run: python web_checkin.py
         env:
+          LEDGER_ONLY: ${{ inputs.diagnose_only && 'true' || 'false' }}
           GLADOS_COOKIE: ${{ secrets.GLADOS_COOKIE }}

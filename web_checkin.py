@@ -1,8 +1,11 @@
 """Use the ordinary check-in page once, stopping if the site requests verification."""
+import math
 import os
 import re
 import sys
 import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -17,6 +20,32 @@ ALREADY = re.compile(r"today.s observation logged|checkin repeats|already checke
 VERIFICATION = re.compile(r"verify (?:that )?you are human|verify you are a human|verification failed|nothing was recorded|automated check.in detected|请验证您是真人", re.I)
 
 
+def todays_credit(context):
+    zone = ZoneInfo("Asia/Shanghai")
+    today = datetime.now(zone).date()
+    try:
+        response = context.request.get(SITE + "/api/user/points", max_redirects=0, timeout=10000)
+        if not response.ok:
+            return None
+        data = response.json()
+        history = data.get("history") or data.get("list") or []
+    except (Error, ValueError, AttributeError):
+        return None
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("business", "")).lower() not in {"system:checkin", "checkin", "check-in", "check_in"}:
+            continue
+        try:
+            day = datetime.fromtimestamp(float(item["time"]) / 1000, zone).date()
+            amount = float(item["change"])
+        except (KeyError, ValueError, TypeError, OverflowError, OSError):
+            continue
+        if day == today and math.isfinite(amount) and amount > 0:
+            return amount
+    return None
+
+
 def check_account(browser, cookie):
     fields = dict(item.strip().split("=", 1) for item in cookie.split(";") if "=" in item)
     names = next((pair for pair in (CURRENT_SESSION_COOKIES, LEGACY_SESSION_COOKIES)
@@ -26,7 +55,26 @@ def check_account(browser, cookie):
     with browser.new_context() as context:
         context.add_cookies([{"name": name, "value": fields[name], "url": SITE + "/",
                               "secure": True, "httpOnly": True} for name in names])
+        credit = todays_credit(context)
+        if credit is not None:
+            return True, f"今日已有签到流水 +{credit:g} 分，本次跳过提交"
+        if os.environ.get("LEDGER_ONLY") == "true":
+            return False, "只读核对未发现当日签到流水，未提交签到"
         page = context.new_page()
+        reply = {}
+
+        def record_status(response):
+            if response.url == SITE + "/api/user/checkin" and response.request.method == "POST":
+                try:
+                    payload = response.json()
+                except (Error, ValueError):
+                    return
+                if isinstance(payload, dict):
+                    reply["code"] = payload.get("code")
+                    reply["verification"] = payload.get("reason") == "turnstile"
+                    reply["already"] = bool(ALREADY.search(str(payload.get("message", ""))))
+
+        page.on("response", record_status)
         page.goto(CHECKIN, wait_until="domcontentloaded", timeout=45000)
         submitted = False
         deadline = time.monotonic() + 45
@@ -35,6 +83,13 @@ def check_account(browser, cookie):
             if location.hostname != "glados.cloud" or location.scheme != "https":
                 return False, "官网发生跨站跳转，已停止"
             body = page.locator("body").inner_text(timeout=5000)
+            if reply.get("verification"):
+                return False, "官网要求人机验证，当次签到未获确认"
+            if reply.get("already"):
+                return True, "官网确认今天已经签到"
+            code = reply.get("code")
+            if type(code) is int and code != 0:
+                return False, f"官网拒绝签到，返回码 {code}"
             if VERIFICATION.search(body) or page.locator('iframe[src*="challenges.cloudflare.com"]:visible').count():
                 return False, "官网要求验证，当次签到未获确认"
             if location.path.startswith("/login") or "Get Code" in body:
@@ -53,6 +108,10 @@ def check_account(browser, cookie):
                 submitted = True
                 button.click(timeout=4000)
             time.sleep(0.8)
+        if submitted:
+            credit = todays_credit(context)
+            if credit is not None:
+                return True, f"提交后可见今日签到流水 +{credit:g} 分"
         return False, "官网未确认签到结果" if submitted else "未看到可用的官网签到按钮"
 
 
